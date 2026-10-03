@@ -1,0 +1,2 @@
+# ignore password files
+*.env
