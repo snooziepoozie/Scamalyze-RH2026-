@@ -1,27 +1,21 @@
 # pipeline.py — all TigerData access lives here
 import os
-from pathlib import Path
-import pandas as pd
 from functools import lru_cache
+from pathlib import Path
+
+import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text, bindparam
+from sqlalchemy import bindparam, create_engine, text
 
-# getting the ip addr
-import urllib.request
-
-ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode()
-print(f"Your current public IP is: {ip}")
-print(f"Add this to TigerData trusted sources as: {ip}/32")
-
-# Load the project-local .env regardless of the working directory used to launch Streamlit.
+# Load the project-local .env regardless of where Streamlit was launched from.
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 
+# ── Connection (shared engine = module-level state) ────────────────────────
 def _db_url() -> str:
     url = os.environ.get("TIGER_DB_URL")
     if not url:
-        raise RuntimeError("Set TIGER_DB_URL in your .env (see setup note).")
-    # SQLAlchemy needs an explicit driver; your string starts with postgres://
+        raise RuntimeError("Set TIGER_DB_URL in your .env file.")
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     return url
@@ -29,10 +23,37 @@ def _db_url() -> str:
 
 @lru_cache(maxsize=1)
 def get_engine():
-    return create_engine(_db_url(), pool_pre_ping=True)
+    """Single shared engine — built once, reused for every query."""
+    return create_engine(
+        _db_url(),
+        pool_pre_ping=True,  # silently revives a dropped connection
+        pool_size=5,
+        max_overflow=2,
+        connect_args={"connect_timeout": 10},
+    )
 
 
-# ── Build a WHERE clause + params from a filters dict ──────────────────────
+def check_connection() -> tuple[bool, str]:
+    """Probe the DB once and report state. Call at app startup."""
+    try:
+        with get_engine().connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True, "connected"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def current_public_ip() -> str:
+    """Call only when debugging an allow-list issue — not at import time."""
+    import urllib.request
+
+    ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode()
+    block = ip[: ip.rfind(".")] + ".0/24"
+    print(f"Current public IP: {ip}  (add to TigerData allow list as {block})")
+    return ip
+
+
+# ── Filter handling ────────────────────────────────────────────────────────
 def _where(filters: dict):
     clauses, params, expanding = [], {}, []
 
@@ -47,10 +68,10 @@ def _where(filters: dict):
     add_in("location", "locations")
     add_in("merchant_category", "merchant_categories")
 
-    ff = filters.get("fraud_filter", "all")
-    if ff == "fraud":
+    fraud_filter = filters.get("fraud_filter", "all")
+    if fraud_filter == "fraud":
         clauses.append("is_fraud = true")
-    elif ff == "legit":
+    elif fraud_filter == "legit":
         clauses.append("is_fraud = false")
 
     if filters.get("start_date"):
@@ -72,69 +93,73 @@ def _where(filters: dict):
 
 def _run(sql: str, params: dict, expanding: list) -> pd.DataFrame:
     stmt = text(sql)
-    for k in expanding:  # IN (:list) needs expanding binds
-        stmt = stmt.bindparams(bindparam(k, expanding=True))
+    for key in expanding:  # IN (:list) needs an expanding bind
+        stmt = stmt.bindparams(bindparam(key, expanding=True))
     return pd.read_sql(stmt, get_engine(), params=params)
 
 
-# ── Dropdown options + slider bounds (run once, cached on the UI side) ─────
+# ── Filter options and bounds (rarely change) ──────────────────────────────
 def get_filter_options() -> dict:
-    eng = get_engine()
-    out = {}
+    engine = get_engine()
+    options = {}
     for col in ("transaction_type", "location", "merchant_category"):
         df = pd.read_sql(
-            text(f"SELECT DISTINCT {col} FROM transactions ORDER BY 1"), eng
+            text(f"SELECT DISTINCT {col} FROM transactions ORDER BY 1"), engine
         )
-        out[col] = df[col].dropna().tolist()
-    return out
+        options[col] = df[col].dropna().tolist()
+    return options
 
 
 def get_bounds() -> pd.Series:
-    sql = """SELECT MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts,
-                    MIN(amount) AS min_amt, MAX(amount) AS max_amt
-             FROM transactions"""
+    sql = """
+        SELECT MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts,
+               MIN(amount)    AS min_amt, MAX(amount)   AS max_amt
+        FROM transactions
+    """
     return _run(sql, {}, []).iloc[0]
 
 
-# ── Aggregations for the dashboard (all return tiny frames) ────────────────
+# ── Aggregations (all return small frames) ─────────────────────────────────
 def get_summary(filters: dict) -> pd.Series:
-    where, p, e = _where(filters)
+    where, params, expanding = _where(filters)
     sql = f"""
-        SELECT COUNT(*)                              AS total_txns,
-               COUNT(*) FILTER (WHERE is_fraud)      AS fraud_txns,
-               COALESCE(SUM(amount), 0)              AS total_amount,
+        SELECT COUNT(*)                                         AS total_txns,
+               COUNT(*) FILTER (WHERE is_fraud)                 AS fraud_txns,
+               COALESCE(SUM(amount), 0)                         AS total_amount,
                COALESCE(SUM(amount) FILTER (WHERE is_fraud), 0) AS fraud_amount
         FROM transactions {where}
     """
-    return _run(sql, p, e).iloc[0]
+    return _run(sql, params, expanding).iloc[0]
 
 
 def get_fraud_by_type(filters: dict) -> pd.DataFrame:
-    where, p, e = _where(filters)
+    where, params, expanding = _where(filters)
     sql = f"""
         SELECT transaction_type,
                COUNT(*)                         AS txns,
                COUNT(*) FILTER (WHERE is_fraud) AS fraud_txns
         FROM transactions {where}
-        GROUP BY transaction_type ORDER BY txns DESC
+        GROUP BY transaction_type
+        ORDER BY txns DESC
     """
-    return _run(sql, p, e)
+    return _run(sql, params, expanding)
 
 
 def get_daily_volume(filters: dict) -> pd.DataFrame:
-    where, p, e = _where(filters)
+    where, params, expanding = _where(filters)
     sql = f"""
-        SELECT date_trunc('day', timestamp) AS day,
+        SELECT date_trunc('day', timestamp)     AS day,
                COUNT(*)                         AS txns,
                COUNT(*) FILTER (WHERE is_fraud) AS fraud_txns
         FROM transactions {where}
-        GROUP BY 1 ORDER BY 1
+        GROUP BY 1
+        ORDER BY 1
     """
-    return _run(sql, p, e)
+    return _run(sql, params, expanding)
 
 
 def get_sample(filters: dict, limit: int = 500) -> pd.DataFrame:
-    where, p, e = _where(filters)
+    where, params, expanding = _where(filters)
     sql = f"""
         SELECT transaction_id, timestamp, sender_account, receiver_account,
                amount, transaction_type, merchant_category, location, is_fraud
@@ -142,4 +167,4 @@ def get_sample(filters: dict, limit: int = 500) -> pd.DataFrame:
         ORDER BY timestamp DESC
         LIMIT :limit
     """
-    return _run(sql, {**p, "limit": limit}, e)
+    return _run(sql, {**params, "limit": limit}, expanding)
