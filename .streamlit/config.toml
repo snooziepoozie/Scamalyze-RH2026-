@@ -1,6 +1,6 @@
 
 [theme]
-backgroundColor="#f5f5ed"
+backgroundColor="#f0f0de"
 
 chartCategoricalColors = [
     "#6caf43",
@@ -14,7 +14,7 @@ font="Nunito:https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,200..10
 codeFont="'Space Mono':https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap, monospace"
 
 # note: for sidebar/widgets
-secondaryBackgroundColor="#e6e6e6" 
+secondaryBackgroundColor="#dfe0ca" 
 
 
 primaryColor="#6caf43"

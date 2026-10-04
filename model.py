@@ -1,4 +1,3 @@
-# note: run python -c "import model; model.train_model()" to retrain the model
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +7,7 @@ import torch.nn as nn
 import torch.utils.data as data_utils
 from sklearn.preprocessing import StandardScaler
 import joblib
+import os
 
 import pipeline as pl
 
@@ -201,47 +201,3 @@ class FocalLoss(nn.Module):
         )
         pt = torch.exp(-bce)
         return (self.alpha * ((1 - pt) ** self.gamma) * bce).mean()
-
-
-def train_model(max_rows: int = 500_000, epochs: int = 10):
-    """Pull data via pipeline, train, and save model + scaler next to this file."""
-    df = pl.get_filtered_export({}, max_rows=max_rows)
-    df = df.dropna(subset=["is_fraud"])
-
-    # Only 'amount' exists for both Tiger and Solana; the others are Tiger-only.
-    # If your Tiger table lacks the four score columns, they're imputed to 0.
-    feats = pd.DataFrame(index=df.index)
-    feats["amount"] = df["amount"].fillna(0.0)
-    for col in SOLANA_MISSING:
-        feats[col] = df[col].fillna(0.0) if col in df.columns else 0.0
-
-    X = feats[FEATURE_COLS].values
-    y = df["is_fraud"].astype(float).values
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    ds = data_utils.TensorDataset(
-        torch.tensor(X_scaled, dtype=torch.float32),
-        torch.tensor(y, dtype=torch.float32),
-    )
-    loader = data_utils.DataLoader(ds, batch_size=2048, shuffle=True)
-
-    model = FraudNet(len(FEATURE_COLS))
-    criterion = FocalLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    model.train()
-    for epoch in range(1, epochs + 1):
-        total = 0.0
-        for xb, yb in loader:
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-            total += loss.item() * len(xb)
-        print(f"epoch {epoch}/{epochs}  loss {total/len(ds):.4f}")
-
-    torch.save(model.state_dict(), MODEL_PATH)
-    joblib.dump(scaler, SCALER_PATH)
-    print(f"Saved {MODEL_PATH.name} and {SCALER_PATH.name}")

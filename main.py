@@ -1,6 +1,9 @@
 import streamlit as st
 import pipeline as pl
-from model import train_model
+from pathlib import Path
+
+# inside static (just incase)
+IMAGE_DIR = Path(__file__).resolve().parent / "static"
 
 st.set_page_config(page_title="Scamalyze", layout="wide")
 
@@ -13,8 +16,18 @@ if not st.session_state.db_ok:
     st.caption(st.session_state.db_msg)
     st.stop()
 
+# sidebar
+with st.sidebar:
+    st.title("Scamalyze")
+    st.image(
+        "https://media1.tenor.com/m/viWX9VvemBkAAAAd/cat-silly.gif",
+        width=300,
+    )
+
 pages = [
     st.Page("views/dashboard.py", title="Dashboard", icon=":material/dashboard:"),
     st.Page("views/runmodel.py", title="Fraud Model", icon=":material/smart_toy:"),
 ]
+
+
 st.navigation(pages).run()

@@ -53,6 +53,81 @@ def current_public_ip() -> str:
     return ip
 
 
+def get_solana_transactions(wallet: str, limit: int = 100) -> pd.DataFrame:
+    """Fetch a wallet's parsed transactions from Helius into the app's schema.
+
+    Returns the 8 columns the model/dashboard expect. The three off-chain
+    columns (transaction_type is real-ish; merchant_category, location) are
+    filled with placeholders since Solana has no equivalent — the model
+    ignores them anyway.
+    """
+    import requests
+
+    api_key = os.environ.get("HELIUS_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set HELIUS_API_KEY in your .env file.")
+
+    url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+    resp = requests.get(url, params={"api-key": api_key, "limit": limit}, timeout=15)
+    resp.raise_for_status()
+    txns = resp.json()
+
+    rows = []
+    for tx in txns:
+        sig = tx.get("signature")
+        ts = (
+            pd.to_datetime(tx.get("timestamp"), unit="s")
+            if tx.get("timestamp")
+            else pd.NaT
+        )
+        tx_type = tx.get("type", "UNKNOWN")
+
+        transfers = tx.get("nativeTransfers") or []
+        if transfers:
+            for t in transfers:
+                rows.append(
+                    {
+                        "transaction_id": sig,
+                        "timestamp": ts,
+                        "sender_account": t.get("fromUserAccount", "unknown"),
+                        "receiver_account": t.get("toUserAccount", "unknown"),
+                        "amount": (t.get("amount", 0) or 0) / 1e9,  # lamports -> SOL
+                        "transaction_type": tx_type,
+                        "merchant_category": None,  # no on-chain equivalent
+                        "location": None,  # no on-chain equivalent
+                        "is_fraud": False,  # unlabeled — placeholder
+                    }
+                )
+        else:
+            # Keep non-transfer transactions (swaps, etc.) as a single row.
+            rows.append(
+                {
+                    "transaction_id": sig,
+                    "timestamp": ts,
+                    "sender_account": tx.get("feePayer", "unknown"),
+                    "receiver_account": "unknown",
+                    "amount": (tx.get("fee", 0) or 0) / 1e9,
+                    "transaction_type": tx_type,
+                    "merchant_category": None,
+                    "location": None,
+                    "is_fraud": False,
+                }
+            )
+
+    cols = [
+        "transaction_id",
+        "timestamp",
+        "sender_account",
+        "receiver_account",
+        "amount",
+        "transaction_type",
+        "merchant_category",
+        "location",
+        "is_fraud",
+    ]
+    return pd.DataFrame(rows, columns=cols)
+
+
 # ── Filter handling ────────────────────────────────────────────────────────
 def _where(filters: dict):
     clauses, params, expanding = [], {}, []
@@ -201,6 +276,7 @@ def mock_solana_transactions() -> pd.DataFrame:
 
 
 # DOWNLOAD NOW!!!!
+
 
 def get_filtered_export(filters: dict, max_rows: int = 100_000) -> pd.DataFrame:
     """Full filtered set for CSV download, capped so the browser doesn't choke."""

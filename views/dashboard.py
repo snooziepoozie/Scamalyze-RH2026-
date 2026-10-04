@@ -94,10 +94,6 @@ with st.container(border=True):
         (float(bounds["min_amt"]), float(bounds["max_amt"])),
     )
 
-    if st.button("Export Data", icon=":material/download:"):
-        # filters is built just below; build it before the button needs it
-        pass
-
 
 # ── Assemble filters dict ────────────────────────────────────────────────────
 filters = {
