@@ -168,3 +168,48 @@ def get_sample(filters: dict, limit: int = 500) -> pd.DataFrame:
         LIMIT :limit
     """
     return _run(sql, {**params, "limit": limit}, expanding)
+
+
+# incase we have no address
+def mock_solana_transactions() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "transaction_id": "3A7d8F9g",
+                "timestamp": pd.Timestamp.now(),
+                "sender_account": "3uv7g8",
+                "receiver_account": "8vY1b9",
+                "amount": 0.05,
+                "transaction_type": "transfer",
+                "merchant_category": None,
+                "location": None,
+                "is_fraud": False,
+            },
+            {
+                "transaction_id": "8Hj2Kl9s",
+                "timestamp": pd.Timestamp.now(),
+                "sender_account": "9xR4f1",
+                "receiver_account": "3uv7g8",
+                "amount": 12.4,
+                "transaction_type": "transfer",
+                "merchant_category": None,
+                "location": None,
+                "is_fraud": False,
+            },
+        ]
+    )
+
+
+# DOWNLOAD NOW!!!!
+
+def get_filtered_export(filters: dict, max_rows: int = 100_000) -> pd.DataFrame:
+    """Full filtered set for CSV download, capped so the browser doesn't choke."""
+    where, params, expanding = _where(filters)
+    sql = f"""
+        SELECT transaction_id, timestamp, sender_account, receiver_account,
+               amount, transaction_type, merchant_category, location, is_fraud
+        FROM transactions {where}
+        ORDER BY timestamp DESC
+        LIMIT :limit
+    """
+    return _run(sql, {**params, "limit": max_rows}, expanding)

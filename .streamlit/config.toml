@@ -1,0 +1,25 @@
+
+[theme]
+backgroundColor="#f5f5ed"
+
+chartCategoricalColors = [
+    "#6caf43",
+    "#ffb433",
+    "#ff7433",
+    "#ff3358",
+    "#af438d" 
+]
+
+font="Nunito:https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,200..1000;1,200..1000, sans-serif"
+codeFont="'Space Mono':https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap, monospace"
+
+# note: for sidebar/widgets
+secondaryBackgroundColor="#e6e6e6" 
+
+
+primaryColor="#6caf43"
+textColor="#3b3b3a"
+baseFontSize = 19
+
+[theme.sidebar]
+textColor="#3b3b3a"
