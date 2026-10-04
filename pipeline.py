@@ -1,191 +1,145 @@
-# pipeline.py
+# pipeline.py — all TigerData access lives here
+import os
 from pathlib import Path
-from dataclasses import dataclass
-import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.metrics import precision_recall_fscore_support, average_precision_score
-import kagglehub
+from functools import lru_cache
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text, bindparam
 
-# Friendly dropdown label -> actual filename
-DATASETS = {
-    "HI-Small": "HI-Small_Trans.csv",
-    "HI-Medium": "HI-Medium_Trans.csv",
-    "LI-Small": "LI-Small_Trans.csv",
-    "LI-Medium": "LI-Medium_Trans.csv",
-}
+# getting the ip addr
+import urllib.request
 
-TRANS_DTYPES = {
-    "From Bank": "int32",
-    "To Bank": "int32",
-    "Account": "string",
-    "Account.1": "string",
-    "Amount Received": "float64",
-    "Amount Paid": "float64",
-    "Receiving Currency": "category",
-    "Payment Currency": "category",
-    "Payment Format": "category",
-    "Is Laundering": "int8",
-}
-NUMERIC_COLS = [
-    "amt_paid_log",
-    "amt_recv_log",
-    "amt_diff",
-    "cross_currency",
-    "hour",
-    "dayofweek",
-]
-CAT_COLS = ["pay_currency", "recv_currency", "pay_format"]
+ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode()
+print(f"Your current public IP is: {ip}")
+print(f"Add this to TigerData trusted sources as: {ip}/32")
+
+# Load the project-local .env regardless of the working directory used to launch Streamlit.
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 
-def load_data(dataset_name: str) -> pd.DataFrame:
-    if dataset_name not in DATASETS:
-        raise ValueError(f"Unknown dataset {dataset_name!r}. Options: {list(DATASETS)}")
-    dataset_dir = Path(
-        kagglehub.dataset_download(
-            "ealtman2019/ibm-transactions-for-anti-money-laundering-aml"
+def _db_url() -> str:
+    url = os.environ.get("TIGER_DB_URL")
+    if not url:
+        raise RuntimeError("Set TIGER_DB_URL in your .env (see setup note).")
+    # SQLAlchemy needs an explicit driver; your string starts with postgres://
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    return url
+
+
+@lru_cache(maxsize=1)
+def get_engine():
+    return create_engine(_db_url(), pool_pre_ping=True)
+
+
+# ── Build a WHERE clause + params from a filters dict ──────────────────────
+def _where(filters: dict):
+    clauses, params, expanding = [], {}, []
+
+    def add_in(col, key):
+        vals = filters.get(key)
+        if vals:
+            clauses.append(f"{col} IN :{key}")
+            params[key] = list(vals)
+            expanding.append(key)
+
+    add_in("transaction_type", "txn_types")
+    add_in("location", "locations")
+    add_in("merchant_category", "merchant_categories")
+
+    ff = filters.get("fraud_filter", "all")
+    if ff == "fraud":
+        clauses.append("is_fraud = true")
+    elif ff == "legit":
+        clauses.append("is_fraud = false")
+
+    if filters.get("start_date"):
+        clauses.append("timestamp >= :start_date")
+        params["start_date"] = filters["start_date"]
+    if filters.get("end_date"):
+        clauses.append("timestamp <= :end_date")
+        params["end_date"] = filters["end_date"]
+    if filters.get("min_amount") is not None:
+        clauses.append("amount >= :min_amount")
+        params["min_amount"] = filters["min_amount"]
+    if filters.get("max_amount") is not None:
+        clauses.append("amount <= :max_amount")
+        params["max_amount"] = filters["max_amount"]
+
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params, expanding
+
+
+def _run(sql: str, params: dict, expanding: list) -> pd.DataFrame:
+    stmt = text(sql)
+    for k in expanding:  # IN (:list) needs expanding binds
+        stmt = stmt.bindparams(bindparam(k, expanding=True))
+    return pd.read_sql(stmt, get_engine(), params=params)
+
+
+# ── Dropdown options + slider bounds (run once, cached on the UI side) ─────
+def get_filter_options() -> dict:
+    eng = get_engine()
+    out = {}
+    for col in ("transaction_type", "location", "merchant_category"):
+        df = pd.read_sql(
+            text(f"SELECT DISTINCT {col} FROM transactions ORDER BY 1"), eng
         )
-    )
-    path = next(
-        p for p in dataset_dir.rglob("*.csv") if p.name == DATASETS[dataset_name]
-    )
-    return pd.read_csv(path, dtype=TRANS_DTYPES, parse_dates=["Timestamp"])
-
-
-def engineer(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-    out["amt_paid_log"] = np.log1p(df["Amount Paid"])
-    out["amt_recv_log"] = np.log1p(df["Amount Received"])
-    out["amt_diff"] = (df["Amount Paid"] - df["Amount Received"]).abs()
-    out["cross_currency"] = (
-        df["Payment Currency"].astype(str) != df["Receiving Currency"].astype(str)
-    ).astype(int)
-    ts = pd.to_datetime(df["Timestamp"])
-    out["hour"] = ts.dt.hour
-    out["dayofweek"] = ts.dt.dayofweek
-    out["pay_currency"] = df["Payment Currency"].astype(str)
-    out["recv_currency"] = df["Receiving Currency"].astype(str)
-    out["pay_format"] = df["Payment Format"].astype(str)
+        out[col] = df[col].dropna().tolist()
     return out
 
 
-class FraudNet(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-
-    def forward(self, x):
-        return self.net(x)
+def get_bounds() -> pd.Series:
+    sql = """SELECT MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts,
+                    MIN(amount) AS min_amt, MAX(amount) AS max_amt
+             FROM transactions"""
+    return _run(sql, {}, []).iloc[0]
 
 
-@dataclass
-class TrainedBundle:
-    """Everything you need to make a prediction later — keep these together."""
-
-    model: FraudNet
-    preprocessor: ColumnTransformer
-    metrics: dict
-    n_features: int
-
-
-def train_model(
-    df: pd.DataFrame, epochs: int = 5, lr: float = 1e-3, progress_cb=None
-) -> TrainedBundle:
-    """Pure training function. progress_cb(epoch, total, loss) is optional —
-    the Streamlit app passes one to drive a progress bar; the notebook omits it."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    df = df.sort_values("Timestamp")
-    cut = int(len(df) * 0.8)
-    train, test = df.iloc[:cut], df.iloc[cut:]
-
-    pre = ColumnTransformer(
-        [
-            ("num", StandardScaler(), NUMERIC_COLS),
-            (
-                "cat",
-                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-                CAT_COLS,
-            ),
-        ]
-    )
-    X_train = pre.fit_transform(engineer(train)).astype("float32")
-    X_test = pre.transform(engineer(test)).astype("float32")
-    y_train = train["Is Laundering"].to_numpy("float32")
-    y_test = test["Is Laundering"].to_numpy("float32")
-    n_features = X_train.shape[1]
-
-    train_dl = DataLoader(
-        TensorDataset(
-            torch.from_numpy(X_train), torch.from_numpy(y_train).unsqueeze(1)
-        ),
-        batch_size=4096,
-        shuffle=True,
-    )
-
-    model = FraudNet(n_features).to(device)
-    pos = y_train.sum()
-    neg = len(y_train) - pos
-    criterion = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor([neg / pos], device=device)
-    )
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    for epoch in range(epochs):
-        model.train()
-        running = 0.0
-        for xb, yb in train_dl:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-            running += loss.item() * len(xb)
-        epoch_loss = running / len(train_dl.dataset)
-        if progress_cb:
-            progress_cb(epoch + 1, epochs, epoch_loss)
-
-    # evaluate
-    model.eval()
-    with torch.no_grad():
-        probs = (
-            torch.sigmoid(model(torch.from_numpy(X_test).to(device)))
-            .cpu()
-            .numpy()
-            .ravel()
-        )
-    preds = (probs >= 0.5).astype(int)
-    p, r, f1, _ = precision_recall_fscore_support(
-        y_test, preds, average="binary", zero_division=0
-    )
-    metrics = {
-        "precision": p,
-        "recall": r,
-        "f1": f1,
-        "auc_pr": average_precision_score(y_test, probs),
-        "test_positives": int(y_test.sum()),
-    }
-
-    return TrainedBundle(model, pre, metrics, n_features)
+# ── Aggregations for the dashboard (all return tiny frames) ────────────────
+def get_summary(filters: dict) -> pd.Series:
+    where, p, e = _where(filters)
+    sql = f"""
+        SELECT COUNT(*)                              AS total_txns,
+               COUNT(*) FILTER (WHERE is_fraud)      AS fraud_txns,
+               COALESCE(SUM(amount), 0)              AS total_amount,
+               COALESCE(SUM(amount) FILTER (WHERE is_fraud), 0) AS fraud_amount
+        FROM transactions {where}
+    """
+    return _run(sql, p, e).iloc[0]
 
 
-def predict_one(bundle: TrainedBundle, raw_txn: dict) -> float:
-    """raw_txn is a dict with the same raw columns as the CSV (minus label/IDs)."""
-    device = next(bundle.model.parameters()).device
-    X = bundle.preprocessor.transform(engineer(pd.DataFrame([raw_txn]))).astype(
-        "float32"
-    )
-    bundle.model.eval()
-    with torch.no_grad():
-        return torch.sigmoid(bundle.model(torch.from_numpy(X).to(device))).item()
+def get_fraud_by_type(filters: dict) -> pd.DataFrame:
+    where, p, e = _where(filters)
+    sql = f"""
+        SELECT transaction_type,
+               COUNT(*)                         AS txns,
+               COUNT(*) FILTER (WHERE is_fraud) AS fraud_txns
+        FROM transactions {where}
+        GROUP BY transaction_type ORDER BY txns DESC
+    """
+    return _run(sql, p, e)
+
+
+def get_daily_volume(filters: dict) -> pd.DataFrame:
+    where, p, e = _where(filters)
+    sql = f"""
+        SELECT date_trunc('day', timestamp) AS day,
+               COUNT(*)                         AS txns,
+               COUNT(*) FILTER (WHERE is_fraud) AS fraud_txns
+        FROM transactions {where}
+        GROUP BY 1 ORDER BY 1
+    """
+    return _run(sql, p, e)
+
+
+def get_sample(filters: dict, limit: int = 500) -> pd.DataFrame:
+    where, p, e = _where(filters)
+    sql = f"""
+        SELECT transaction_id, timestamp, sender_account, receiver_account,
+               amount, transaction_type, merchant_category, location, is_fraud
+        FROM transactions {where}
+        ORDER BY timestamp DESC
+        LIMIT :limit
+    """
+    return _run(sql, {**p, "limit": limit}, e)

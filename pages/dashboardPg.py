@@ -1,6 +1,7 @@
 import streamlit as st
-from pipeline import DATASETS
+import pipeline as pl
 
 
-# model dropdown
-dataset_name = st.selectbox("Choose a dataset to view", list(DATASETS))
+st.title("Transaction sample")
+st.caption("Showing the most recent transactions from TigerData.")
+st.dataframe(pl.get_sample({}), use_container_width=True)
